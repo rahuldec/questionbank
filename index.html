@@ -230,6 +230,21 @@
     font-variant-numeric:tabular-nums;
   }
 
+  .key-row{display:flex;gap:6px;}
+  .key-row input{
+    flex:1;min-width:0;
+    font-family:var(--font-mono);font-size:12.5px;
+    padding:9px 10px;
+    border:1px solid var(--line-strong);
+    border-radius:8px;
+    background:var(--sheet);color:var(--ink);
+  }
+  .key-row input:focus{outline:none;border-color:var(--accent);}
+  .key-actions{display:flex;gap:8px;margin-top:8px;}
+  .key-actions .btn-sm{flex:1;justify-content:center;}
+  .hint{font-size:11px;color:var(--ink-faint);line-height:1.5;}
+  .hint a{color:var(--accent);}
+
   .pillrow{display:flex;gap:6px;flex-wrap:wrap;}
   .pill{
     font-family:var(--font-mono);
@@ -436,13 +451,27 @@
       <h1>Examsmith</h1>
       <div class="sub">Upload a textbook chapter or notes as a PDF — get a question bank written strictly from its own content, with an answer key.</div>
     </div>
-    <div class="mark" id="capMark">checking AI access…</div>
+    <div class="mark" id="keyMark">no API key set</div>
   </header>
 
   <div class="layout">
 
     <!-- ================= CONTROL DESK ================= -->
     <div class="desk">
+
+      <div class="card" id="apiCard">
+        <h2>Anthropic API key</h2>
+        <div class="key-row">
+          <input type="password" id="apiKeyInput" placeholder="sk-ant-…" autocomplete="off" spellcheck="false">
+          <button type="button" class="btn-sm" id="toggleKeyVis" title="Show/hide">👁</button>
+        </div>
+        <div class="key-actions">
+          <button type="button" class="btn-sm" id="saveKeyBtn">Save key</button>
+          <button type="button" class="btn-sm" id="clearKeyBtn">Clear</button>
+        </div>
+        <div class="hint" style="margin-top:9px;">Stored only in this browser (localStorage) and sent directly to <b>api.anthropic.com</b> — never to any server of ours. Get a key at <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a>.</div>
+        <div class="pillrow" id="modelPills" style="margin-top:11px;"></div>
+      </div>
 
       <div class="card">
         <h2>Source PDF</h2>
@@ -492,7 +521,7 @@
         <div class="toolbar-actions">
           <button class="btn-sm" id="revealBtn">👁 Show answer key</button>
           <button class="btn-sm" id="printBtn">🖨 Print / Save as PDF</button>
-          <button class="btn-sm" id="downloadBtn" hidden>⬇ Download .txt</button>
+          <button class="btn-sm" id="downloadBtn">⬇ Download .txt</button>
         </div>
       </div>
       <div class="sheet" id="sheet"></div>
@@ -510,7 +539,15 @@
   }
 
   // ---------- constants ----------
-  var CHAR_CAP = 45000;
+  var CHAR_CAP = 60000;
+  var API_URL = "https://api.anthropic.com/v1/messages";
+  var API_VERSION = "2023-06-01";
+  var KEY_STORAGE = "examsmith_anthropic_key";
+  var MODEL_TIERS = [
+    { key:"quick", label:"Fast", model:"claude-haiku-4-5-20251001" },
+    { key:"default", label:"Balanced", model:"claude-sonnet-5" },
+    { key:"complex", label:"Powerful", model:"claude-opus-5" }
+  ];
   var QUESTION_TYPES = [
     { key:"mcq", label:"Multiple choice", hint:"4 options, one correct", def:6,
       instr:"multiple-choice questions, each with exactly 4 options labelled internally A-D and exactly one correct option" },
@@ -537,8 +574,8 @@
   var state = {
     counts: {}, difficulty: "mixed", includeAnswers: true,
     pdf: null, // {title, text, pages, charsUsed, truncated, fileName, fileSize}
-    generating: false, sampleFn: null, downloadsFn: null,
-    ctl: null, capabilityKnown: false, capabilityOk: false,
+    generating: false, apiKey: "", modelTier: "default",
+    ctl: null, genTimer: null, genStart: 0,
     lastBank: null, isExample: true
   };
   QUESTION_TYPES.forEach(function(t){ state.counts[t.key] = t.def; });
@@ -550,7 +587,9 @@
   var diffPills = $("diffPills"), answerSwitch = $("answerSwitch");
   var genBtn = $("genBtn"), genBtnLabel = $("genBtnLabel"), stopBtn = $("stopBtn"), errorBox = $("errorBox");
   var sheet = $("sheet"), sheetStatus = $("sheetStatus"), revealBtn = $("revealBtn");
-  var printBtn = $("printBtn"), downloadBtn = $("downloadBtn"), capMark = $("capMark");
+  var printBtn = $("printBtn"), downloadBtn = $("downloadBtn"), keyMark = $("keyMark");
+  var apiKeyInput = $("apiKeyInput"), toggleKeyVis = $("toggleKeyVis"), saveKeyBtn = $("saveKeyBtn"),
+      clearKeyBtn = $("clearKeyBtn"), modelPills = $("modelPills");
 
   // ---------- render: question-type controls ----------
   function renderTypeList(){
@@ -709,29 +748,131 @@
     });
   }
 
-  // ---------- capability wiring ----------
-  function initCapabilities(){
-    if(!window.claude || !window.claude.use){
-      capMark.textContent = "AI generation unavailable here";
-      state.capabilityKnown = true; state.capabilityOk = false;
-      refreshGenerateButton();
-      return;
+  // ---------- API key + model tier ----------
+  function safeLocalStorage(){
+    try { window.localStorage.setItem("__examsmith_probe__","1"); window.localStorage.removeItem("__examsmith_probe__"); return window.localStorage; }
+    catch(e){ return null; }
+  }
+  var LS = safeLocalStorage();
+
+  function maskKey(k){
+    if(!k) return "";
+    return k.length <= 8 ? "••••" : k.slice(0,7) + "…" + k.slice(-4);
+  }
+
+  function updateKeyMark(){
+    keyMark.textContent = state.apiKey ? ("API key saved (" + maskKey(state.apiKey) + ")") : "no API key set";
+  }
+
+  function loadKey(){
+    if(LS){
+      var k = LS.getItem(KEY_STORAGE);
+      if(k) state.apiKey = k;
     }
-    window.claude.use("sample").then(function(fn){
-      state.sampleFn = fn;
-      state.capabilityKnown = true;
-      state.capabilityOk = !!fn;
-      capMark.textContent = fn ? "AI generation ready" : "AI generation unavailable here";
-      refreshGenerateButton();
-    }).catch(function(){
-      state.capabilityKnown = true; state.capabilityOk = false;
-      capMark.textContent = "AI generation unavailable here";
-      refreshGenerateButton();
+    updateKeyMark();
+    refreshGenerateButton();
+  }
+
+  saveKeyBtn.addEventListener("click", function(){
+    var v = apiKeyInput.value.trim();
+    if(!v) return;
+    state.apiKey = v;
+    if(LS){ try { LS.setItem(KEY_STORAGE, v); } catch(e){} }
+    apiKeyInput.value = "";
+    apiKeyInput.type = "password";
+    updateKeyMark();
+    refreshGenerateButton();
+  });
+  clearKeyBtn.addEventListener("click", function(){
+    state.apiKey = "";
+    if(LS){ try { LS.removeItem(KEY_STORAGE); } catch(e){} }
+    apiKeyInput.value = "";
+    updateKeyMark();
+    refreshGenerateButton();
+  });
+  toggleKeyVis.addEventListener("click", function(){
+    apiKeyInput.type = apiKeyInput.type === "password" ? "text" : "password";
+  });
+
+  function renderModelPills(){
+    modelPills.innerHTML = "";
+    MODEL_TIERS.forEach(function(t){
+      var b = document.createElement("button");
+      b.type = "button"; b.className = "pill" + (state.modelTier===t.key ? " on":"");
+      b.textContent = t.label; b.setAttribute("data-key", t.key);
+      modelPills.appendChild(b);
     });
-    window.claude.use("downloads").then(function(fn){
-      state.downloadsFn = fn;
-      downloadBtn.hidden = !fn;
-    }).catch(function(){ downloadBtn.hidden = true; });
+  }
+  modelPills.addEventListener("click", function(e){
+    var b = e.target.closest(".pill"); if(!b) return;
+    state.modelTier = b.getAttribute("data-key");
+    renderModelPills();
+  });
+
+  // ---------- tolerant JSON extraction from a text reply ----------
+  function extractJson(text){
+    text = String(text || "").trim();
+    try { return JSON.parse(text); } catch(e){}
+    var fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    if(fence){
+      try { return JSON.parse(fence[1].trim()); } catch(e){}
+    }
+    var firstCurly = text.indexOf("{"), firstBracket = text.indexOf("[");
+    var start, endChar;
+    if(firstCurly === -1 && firstBracket === -1) throw new Error("no JSON found in reply");
+    if(firstBracket === -1 || (firstCurly !== -1 && firstCurly < firstBracket)){ start = firstCurly; endChar = "}"; }
+    else { start = firstBracket; endChar = "]"; }
+    var end = text.lastIndexOf(endChar);
+    if(end === -1 || end < start) throw new Error("no JSON found in reply");
+    return JSON.parse(text.slice(start, end+1));
+  }
+
+  // ---------- call the Anthropic API directly from the browser ----------
+  function callClaude(prompt, opts){
+    opts = opts || {};
+    if(!state.apiKey){
+      return Promise.reject({ code:"no_key", message:"No API key set" });
+    }
+    var tier = MODEL_TIERS.filter(function(t){ return t.key === state.modelTier; })[0] || MODEL_TIERS[1];
+    var body = {
+      model: tier.model,
+      max_tokens: 8000,
+      messages: [{ role:"user", content: prompt }]
+    };
+    return fetch(API_URL, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": state.apiKey,
+        "anthropic-version": API_VERSION,
+        "anthropic-dangerous-direct-browser-access": "true"
+      },
+      body: JSON.stringify(body),
+      signal: opts.signal
+    }).then(function(res){
+      return res.json().catch(function(){ return null; }).then(function(json){
+        if(!res.ok){
+          var code = "upstream_error";
+          if(res.status === 401) code = "invalid_key";
+          else if(res.status === 429) code = "rate_limited";
+          else if(res.status === 529) code = "overloaded";
+          else if(res.status === 400) code = "bad_request";
+          var msg = (json && json.error && json.error.message) || res.statusText || ("HTTP " + res.status);
+          return Promise.reject({ code: code, message: msg });
+        }
+        var text = ((json && json.content) || [])
+          .filter(function(b){ return b && b.type === "text"; })
+          .map(function(b){ return b.text; }).join("");
+        if(!text.trim()) return Promise.reject({ code:"empty_completion", message:"No text returned" });
+        var data;
+        try { data = extractJson(text); }
+        catch(e){ return Promise.reject({ code:"invalid_json", message:"Could not parse the reply as JSON" }); }
+        return data;
+      });
+    }, function(err){
+      if(err && err.name === "AbortError") return Promise.reject({ code:"cancelled", message:"Cancelled" });
+      return Promise.reject({ code:"network_error", message:(err && err.message) || "Network error" });
+    });
   }
 
   // ---------- generate button state ----------
@@ -750,8 +891,8 @@
       genBtn.disabled = true; genBtnLabel.textContent = "Pick at least one question type";
       return;
     }
-    if(state.capabilityKnown && !state.capabilityOk){
-      genBtn.disabled = true; genBtnLabel.textContent = "AI generation unavailable";
+    if(!state.apiKey){
+      genBtn.disabled = true; genBtnLabel.textContent = "Add an API key first";
       return;
     }
     genBtn.disabled = false;
@@ -793,13 +934,13 @@
 
     state.generating = true; errorBox.hidden = true; refreshGenerateButton();
     stopBtn.hidden = false;
-    sheetStatus.textContent = "Generating from " + escapeHtml(state.pdf.fileName) + "…";
+    startGenTimer(state.pdf.fileName);
 
     var ctl = new AbortController();
     state.ctl = ctl;
     var prompt = buildPrompt(state.pdf, sections, difficulty);
 
-    state.sampleFn.json(prompt, { modelTier: "default", cache: false, signal: ctl.signal })
+    callClaude(prompt, { signal: ctl.signal })
       .then(function(data){
         var bank = normalizeBank(data, sections);
         state.lastBank = bank; state.isExample = false;
@@ -808,10 +949,11 @@
       })
       .catch(function(e){
         if(e && e.code === "cancelled") { sheetStatus.textContent = "Cancelled"; return; }
-        handleSampleError(e);
+        handleGenError(e);
       })
       .finally(function(){
-        state.generating = false; state.ctl = null; stopBtn.hidden = true; refreshGenerateButton();
+        state.generating = false; state.ctl = null; stopBtn.hidden = true;
+        stopGenTimer(); refreshGenerateButton();
       });
   });
 
@@ -819,23 +961,35 @@
     if(state.ctl) state.ctl.abort();
   });
 
-  function handleSampleError(e){
+  function startGenTimer(fileName){
+    state.genStart = Date.now();
+    var label = "Generating from " + escapeHtml(fileName) + "… ";
+    sheetStatus.textContent = label + "0s";
+    state.genTimer = setInterval(function(){
+      var s = Math.round((Date.now() - state.genStart) / 1000);
+      sheetStatus.textContent = label + s + "s";
+    }, 1000);
+  }
+  function stopGenTimer(){
+    if(state.genTimer){ clearInterval(state.genTimer); state.genTimer = null; }
+  }
+
+  function handleGenError(e){
     var code = (e && e.code) || "upstream_error";
     var msg;
     switch(code){
-      case "not_granted": msg = "AI generation wasn't allowed for this page."; state.capabilityOk = false; break;
-      case "sampling_disabled": msg = "AI generation isn't available for this account."; state.capabilityOk = false; break;
-      case "not_declared": case "capability_disabled": case "capability_removed":
-        msg = "AI generation isn't available in this view."; state.capabilityOk = false; break;
-      case "rate_limited": msg = "Hit a rate limit — wait a moment and try again."; break;
-      case "prompt_too_large": msg = "This document is too large to send in one request — try a shorter chapter."; break;
+      case "no_key": msg = "Add your Anthropic API key first (top of the page)."; break;
+      case "invalid_key": msg = "That API key was rejected by Anthropic — check it's correct and active."; break;
+      case "rate_limited": msg = "Rate limited by the API — wait a moment and try again."; break;
+      case "overloaded": msg = "Anthropic's API is temporarily overloaded — try again shortly."; break;
+      case "bad_request": msg = "The request was rejected (" + escapeHtml((e && e.message) || "bad request") + ") — try a shorter PDF or fewer questions."; break;
       case "invalid_json": msg = "The generated question bank couldn't be parsed — try again."; break;
-      case "refused": msg = "Claude declined to generate from this content. Try a different PDF."; break;
+      case "network_error": msg = "Couldn't reach the API — check your connection and try again."; break;
       case "empty_completion": msg = "No question bank came back — try again with fewer questions."; break;
       default: msg = "Something went wrong generating the question bank — try again.";
     }
     errorBox.hidden = false;
-    errorBox.innerHTML = '<div class="error-box"><b>Couldn\'t generate.</b> ' + escapeHtml(msg) + '</div>';
+    errorBox.innerHTML = '<div class="error-box"><b>Couldn\'t generate.</b> ' + msg + '</div>';
     sheetStatus.textContent = "Generation failed";
     refreshGenerateButton();
   }
@@ -925,7 +1079,7 @@
   printBtn.addEventListener("click", function(){ window.print(); });
 
   downloadBtn.addEventListener("click", function(){
-    if(!state.downloadsFn || !state.lastBank){ return; }
+    if(!state.lastBank){ return; }
     var b = state.lastBank;
     var lines = [];
     lines.push(b.documentTitle || "Question bank");
@@ -959,7 +1113,12 @@
     }
     var text = lines.join("\n");
     var safeName = (b.documentTitle || "question-bank").toLowerCase().replace(/[^a-z0-9]+/g,"-").replace(/(^-|-$)/g,"").slice(0,60) || "question-bank";
-    state.downloadsFn.save({ filename: safeName + ".txt", data: text }).catch(function(){ /* declined or unavailable — no-op */ });
+    var blob = new Blob([text], { type:"text/plain;charset=utf-8" });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url; a.download = safeName + ".txt";
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(function(){ URL.revokeObjectURL(url); }, 2000);
   });
 
   // ---------- example (at-rest) content ----------
@@ -984,9 +1143,10 @@
   // ---------- boot ----------
   renderTypeList();
   renderDiffPills();
+  renderModelPills();
   state.lastBank = exampleBank();
   renderBank(state.lastBank, null, true);
-  initCapabilities();
+  loadKey();
   refreshGenerateButton();
 
 })();
